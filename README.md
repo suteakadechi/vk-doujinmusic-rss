@@ -1,104 +1,95 @@
-# vk-doujinmusic-rss
+# vk-doujinmusic-rss — scraping版
 
-VKコミュニティ `doujinmusic` のウォール投稿を、GitHub Actionsで定期取得し、
-GitHub PagesからRSS 2.0として公開するためのひな形です。
+VK APIを使用せず、公開されているVKウォールのHTMLをPlaywrightで取得し、
+RSS 2.0へ変換してGitHub Pagesから公開します。
 
-## 特徴
+## 対象
 
-- VK APIの `wall.get` を直接使用
+- `https://vk.ru/wall-60027733`
+- コミュニティ短縮名: `doujinmusic`
+
+## API版からの変更点
+
+- VKアプリ不要
+- VKアクセストークン不要
+- GitHub Actions Secret不要
 - Telegramを経由しない
-- VKの1投稿をRSSの1項目として出力
-- 写真・動画・文書・外部リンクなどを同じRSS項目の本文へまとめる
-- 10分間隔で最新300投稿を再取得
-- ローカルサーバー不要
-- パブリックリポジトリならGitHub ActionsとPagesを無料で利用可能
+- VKの1ウォール投稿をRSSの1項目として出力
+- 最新200投稿を10分ごとに再取得
+- `vk.ru`、`vk.com`、各モバイル版を順番に試す
+- VKのJavaScript検証へ対応するためPlaywrightのChromiumを使用
 
-## 1. VKのサービスアクセストークンを用意
+## 既存リポジトリへ導入する方法
 
-VK Developersでアプリケーションを作成し、アプリ設定に表示される
-サービスアクセストークン／Service access keyを取得してください。
+リポジトリ直下へ次を置きます。
 
-`wall.get` はVK APIスキーマ上、ユーザートークンとサービストークンの
-両方に対応しています。トークンはリポジトリ内のファイルへ書かず、
-GitHub Actions Secretへ保存します。
+- `scrape_vk.py`
 
-VKの管理画面は変更されることがあります。サービスキーで
-`wall.get` が拒否される場合は、同じアプリで取得したユーザーアクセストークンを
-代わりに使用してください。
+次のワークフローを作成します。
 
-## 2. GitHubにパブリックリポジトリを作成
+- `.github/workflows/update-rss-scrape.yml`
 
-例:
+API版の `.github/workflows/update-rss.yml` が残っている場合は、
+無効化または削除してください。API版とスクレイピング版を同時に動かすと、
+同じGitHub Pages環境へ同時にデプロイして競合します。
 
-- リポジトリ名: `vk-doujinmusic-rss`
-- Visibility: Public
+GitHub Pagesは次の設定にします。
 
-このひな形の内容を、リポジトリのルートへアップロードします。
+- `Settings`
+- `Pages`
+- `Build and deployment`
+- `Source: GitHub Actions`
 
-## 3. Secretを登録
+その後、次を開いて手動実行します。
 
-リポジトリで次を開きます。
+- `Actions`
+- `Update VK RSS by scraping`
+- `Run workflow`
 
-`Settings` → `Secrets and variables` → `Actions`
-→ `New repository secret`
+成功時のRSS URL:
 
-- Name: `VK_ACCESS_TOKEN`
-- Secret: VKで取得したトークン
+`https://suteakadechi.github.io/vk-doujinmusic-rss/index.xml`
 
-トークンをREADME、YAML、Pythonファイルへ直接書かないでください。
+## 取得件数
 
-## 4. GitHub Pagesを有効にする
-
-`Settings` → `Pages` → `Build and deployment`
-
-- Source: `GitHub Actions`
-
-## 5. 初回実行
-
-`Actions` → `Update VK RSS` → `Run workflow`
-
-成功後、PagesのURLは通常、次の形式です。
-
-`https://GITHUBユーザー名.github.io/vk-doujinmusic-rss/index.xml`
-
-このURLをFeedbroなどへ登録します。
-
-## 取得漏れへの耐性
-
-現在の設定では、10分ごとに最新300投稿を取り直します。
-仮に5分に1投稿でも、300投稿の範囲は約25時間分に相当します。
-
-GitHub Actionsの実行が数回遅延・欠落しても、次の正常実行が
-最新300投稿を再取得するため、短時間の障害で投稿が抜けにくい構成です。
-
-項目数を増やす場合は、ワークフロー内の次の値を変更します。
-
-`VK_POST_LIMIT: "300"`
-
-上限はこのスクリプトでは1000です。VK APIは1回につき最大100投稿なので、
-300なら3回、500なら5回APIを呼び出します。
-
-## 更新間隔
-
-現在は10分間隔です。
+初期設定は200件です。
 
 ```yaml
-- cron: "7,17,27,37,47,57 * * * *"
+VK_POST_LIMIT: "200"
 ```
 
-5分間隔にする場合:
+5分に1投稿なら、200投稿は約16時間40分分です。
+GitHub Actionsが一時的に遅延しても、次の正常実行で直近200投稿を再取得します。
+
+300件に増やす場合:
 
 ```yaml
-- cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+VK_POST_LIMIT: "300"
 ```
 
-毎時0分付近はGitHub Actionsが混雑しやすいため避けています。
+ページ読み込み回数が増えるため、まず200件で動作を確認してください。
 
-## 注意事項
+## 失敗時の確認
 
-- Pagesに公開されるRSS自体は誰でも閲覧できます。
-- VKアクセストークンはGitHub Secretに保存され、Pagesには含まれません。
-- VK APIの仕様変更、トークン失効、対象ページの公開範囲変更により停止する場合があります。
-- Actions画面で失敗した実行を開くと、`VK API error 番号`を確認できます。
-- パブリックリポジトリの定期ワークフローは、長期間活動がないと無効化されるため、
-  月1回だけ自動コミットするkeepalive処理を含めています。
+スクレイピングに失敗すると、Actionsの実行画面に
+`vk-scraping-debug` というアーティファクトが作成されます。
+
+中には次が入ります。
+
+- VKから返されたHTML
+- ページのスクリーンショット
+- HTTPステータス、最終URL、抽出件数などのJSON
+
+VK側のHTML変更、ログイン要求、地域制限、429制限などを切り分けるために使います。
+
+## 制約
+
+この方法はAPIより不安定です。次の場合は停止する可能性があります。
+
+- VKがGitHub ActionsのIPアドレスを制限した
+- 公開ページでもログインが必須になった
+- VKのHTML構造が大きく変更された
+- CAPTCHAや高度なbot判定が表示された
+- `offset` によるページ分割が廃止された
+
+その場合は、debugアーティファクトに合わせて抽出処理を調整します。
