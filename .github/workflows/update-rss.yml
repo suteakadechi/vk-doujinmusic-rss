@@ -1,0 +1,74 @@
+name: Update VK RSS
+
+on:
+  schedule:
+    # 毎時0分付近は混雑しやすいため、7分から10分間隔にしています。
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Generate RSS
+        env:
+          VK_ACCESS_TOKEN: ${{ secrets.VK_ACCESS_TOKEN }}
+          VK_OWNER_ID: "-60027733"
+          VK_SOURCE_URL: "https://vk.ru/doujinmusic"
+          VK_FEED_TITLE: "doujinmusic — VK wall"
+          VK_API_VERSION: "5.199"
+          VK_POST_LIMIT: "300"
+        run: python generate_feed.py
+
+      - name: Keep scheduled workflow active
+        if: github.event_name == 'schedule'
+        shell: bash
+        run: |
+          month="$(date -u +%Y-%m)"
+          current="$(cat .github/keepalive-month.txt 2>/dev/null || true)"
+          if [ "$current" != "$month" ]; then
+            echo "$month" > .github/keepalive-month.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/keepalive-month.txt
+            git commit -m "chore: keep scheduled workflow active"
+            git push
+          fi
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: "_site"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
