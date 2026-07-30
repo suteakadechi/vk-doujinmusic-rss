@@ -6,10 +6,12 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from email.utils import format_datetime
+from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -22,6 +24,9 @@ POST_LIMIT = max(20, min(int(os.environ.get("VK_POST_LIMIT", "200")), 500))
 PAGE_SIZE = max(10, min(int(os.environ.get("VK_PAGE_SIZE", "20")), 50))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "_site"))
 DEBUG_DIR = Path(os.environ.get("DEBUG_DIR", "debug"))
+STATE_FILE = Path(os.environ.get("RSS_STATE_FILE", "data/feed_state.json"))
+PREVIOUS_FEED_URL = os.environ.get("RSS_PREVIOUS_FEED_URL", "").strip()
+STATE_VERSION = 1
 
 POST_RE = re.compile(rf"wall{re.escape(str(WALL_ID))}_(\d+)")
 WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
@@ -88,11 +93,200 @@ def parse_timestamp(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
-        return None
+        try:
+            parsed = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def post_number_from_url(value: str) -> int:
+    match = POST_RE.search(value)
+    return int(match.group(1)) if match else 0
+
+
+def stable_item_from_post(post: dict[str, Any]) -> dict[str, Any]:
+    """初回取得時の内容を、以後変更しないRSS項目として保存します。"""
+    url = normalize_post_url(post.get("url", ""))
+    if not url:
+        raise ValueError(f"Invalid VK post URL: {post.get('url', '')}")
+
+    published = parse_timestamp(post.get("timestamp"))
+    if published is None:
+        # VKのHTMLに機械可読日時がない場合も、初回検出時刻を一度だけ保存します。
+        published = datetime.now(timezone.utc)
+
+    return {
+        "post_number": post_number_from_url(url),
+        "title": make_title(post),
+        "link": url,
+        "guid": url,
+        "guid_is_permalink": "true",
+        "pub_date": format_datetime(published),
+        "description": render_description(post),
+    }
+
+
+def load_state() -> dict[str, dict[str, Any]]:
+    if not STATE_FILE.exists():
+        return {}
+
+    try:
+        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"RSS状態ファイルを読めません: {STATE_FILE}") from exc
+
+    if payload.get("version") != STATE_VERSION:
+        raise RuntimeError(
+            f"未対応のRSS状態ファイルです: version={payload.get('version')}"
+        )
+    if int(payload.get("wall_id", 0)) != WALL_ID:
+        raise RuntimeError(
+            f"RSS状態ファイルのwall_idが一致しません: {payload.get('wall_id')}"
+        )
+
+    items = payload.get("items")
+    if not isinstance(items, dict):
+        raise RuntimeError("RSS状態ファイルのitemsが不正です")
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, item in items.items():
+        if not isinstance(item, dict):
+            continue
+        url = normalize_post_url(str(item.get("link") or key))
+        if not url:
+            continue
+        item = dict(item)
+        item["post_number"] = int(
+            item.get("post_number") or post_number_from_url(url)
+        )
+        normalized[url] = item
+    return normalized
+
+
+def child_by_local_name(parent: ET.Element, name: str) -> ET.Element | None:
+    for child in parent:
+        if child.tag.rsplit("}", 1)[-1] == name:
+            return child
+    return None
+
+
+def import_previous_feed() -> dict[str, dict[str, Any]]:
+    """移行初回だけ、現在公開中のRSSを状態ファイルの種として読み込みます。"""
+    if not PREVIOUS_FEED_URL:
+        return {}
+
+    request = Request(
+        PREVIOUS_FEED_URL,
+        headers={
+            "User-Agent": "github-pages-vk-rss-state-migration/1.0",
+            "Cache-Control": "no-cache",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            data = response.read()
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        print(f"Warning: previous RSS could not be imported: {exc}")
+        return {}
+
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        print(f"Warning: previous RSS is invalid XML: {exc}")
+        return {}
+
+    channel = child_by_local_name(root, "channel")
+    if channel is None:
+        return {}
+
+    imported: dict[str, dict[str, Any]] = {}
+    for node in channel:
+        if node.tag.rsplit("}", 1)[-1] != "item":
+            continue
+
+        title_node = child_by_local_name(node, "title")
+        link_node = child_by_local_name(node, "link")
+        guid_node = child_by_local_name(node, "guid")
+        date_node = child_by_local_name(node, "pubDate")
+        description_node = child_by_local_name(node, "description")
+
+        link = (link_node.text or "").strip() if link_node is not None else ""
+        guid = (guid_node.text or "").strip() if guid_node is not None else ""
+        url = normalize_post_url(link or guid)
+        if not url:
+            continue
+
+        item: dict[str, Any] = {
+            "post_number": post_number_from_url(url),
+            "title": title_node.text or "" if title_node is not None else "",
+            "link": link or url,
+            "guid": guid or url,
+            "guid_is_permalink": (
+                guid_node.attrib.get("isPermaLink", "true")
+                if guid_node is not None
+                else "true"
+            ),
+            "description": (
+                description_node.text or "" if description_node is not None else ""
+            ),
+        }
+        if date_node is not None and (date_node.text or "").strip():
+            item["pub_date"] = (date_node.text or "").strip()
+
+        imported[url] = item
+
+    if imported:
+        print(f"Imported {len(imported)} items from the currently published RSS")
+    return imported
+
+
+def save_state(items: dict[str, dict[str, Any]]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ordered = dict(
+        sorted(
+            items.items(),
+            key=lambda pair: int(pair[1].get("post_number", 0)),
+            reverse=True,
+        )
+    )
+    payload = {
+        "version": STATE_VERSION,
+        "wall_id": WALL_ID,
+        "items": ordered,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    temporary = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    temporary.write_text(serialized, encoding="utf-8")
+    temporary.replace(STATE_FILE)
+
+
+def merge_with_state(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = load_state()
+    if not items:
+        items.update(import_previous_feed())
+
+    added = 0
+    for post in posts:
+        url = normalize_post_url(post.get("url", ""))
+        if not url or url in items:
+            continue
+        items[url] = stable_item_from_post(post)
+        added += 1
+
+    # 直近の投稿だけを保持します。既存項目は本文などを更新せず、そのまま残します。
+    latest = sorted(
+        items.items(),
+        key=lambda pair: int(pair[1].get("post_number", 0)),
+        reverse=True,
+    )[:POST_LIMIT]
+    retained = dict(latest)
+    save_state(retained)
+    print(f"RSS state: {len(retained)} items retained, {added} new items added")
+    return [item for _, item in latest]
 
 
 def make_title(post: dict[str, Any]) -> str:
@@ -153,7 +347,7 @@ def add_text(parent: ET.Element, tag: str, value: str, **attrs: str) -> ET.Eleme
     return node
 
 
-def build_feed(posts: list[dict[str, Any]]) -> ET.ElementTree:
+def build_feed(items: list[dict[str, Any]]) -> ET.ElementTree:
     rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
     add_text(channel, "title", FEED_TITLE)
@@ -165,19 +359,32 @@ def build_feed(posts: list[dict[str, Any]]) -> ET.ElementTree:
     )
     add_text(channel, "language", "ru")
     add_text(channel, "generator", "github-pages-vk-wall-scraper")
-    add_text(channel, "lastBuildDate", format_datetime(datetime.now(timezone.utc)))
 
-    for post in posts:
+    dated_items = [
+        parse_timestamp(item.get("pub_date"))
+        for item in items
+        if item.get("pub_date")
+    ]
+    valid_dates = [value for value in dated_items if value is not None]
+    if valid_dates:
+        # 新着がない実行では、フィード本体を変化させません。
+        add_text(channel, "lastBuildDate", format_datetime(max(valid_dates)))
+
+    for saved in items:
         item = ET.SubElement(channel, "item")
-        add_text(item, "title", make_title(post))
-        add_text(item, "link", post["url"])
-        add_text(item, "guid", post["url"], isPermaLink="true")
+        add_text(item, "title", str(saved.get("title", "")))
+        add_text(item, "link", str(saved.get("link", "")))
+        add_text(
+            item,
+            "guid",
+            str(saved.get("guid") or saved.get("link", "")),
+            isPermaLink=str(saved.get("guid_is_permalink", "true")),
+        )
 
-        published = parse_timestamp(post.get("timestamp"))
-        if published:
-            add_text(item, "pubDate", format_datetime(published))
+        if saved.get("pub_date"):
+            add_text(item, "pubDate", str(saved["pub_date"]))
 
-        add_text(item, "description", render_description(post))
+        add_text(item, "description", str(saved.get("description", "")))
 
     return ET.ElementTree(rss)
 
@@ -492,8 +699,10 @@ def write_output(posts: list[dict[str, Any]], source: str) -> None:
             "ブロックページをRSSとして公開しないため停止します。"
         )
 
+    stable_items = merge_with_state(posts)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    tree = build_feed(posts)
+    tree = build_feed(stable_items)
     ET.indent(tree, space="  ")
     tree.write(
         OUTPUT_DIR / "index.xml",
@@ -508,7 +717,8 @@ def write_output(posts: list[dict[str, Any]], source: str) -> None:
 <title>VK RSS</title>
 <h1>VK RSS</h1>
 <p><a href="index.xml">RSSフィードを開く</a></p>
-<p>取得投稿数: {len(posts)}</p>
+    <p>取得投稿数: {len(posts)}</p>
+    <p>RSS収録数: {len(stable_items)}</p>
 <p>生成日時: {generated}</p>
 <p>取得元ページ: {html.escape(source)}</p>
 <p>対象ウォール: <a href="{html.escape(SOURCE_URL, quote=True)}">{html.escape(SOURCE_URL)}</a></p>
