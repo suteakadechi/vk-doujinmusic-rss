@@ -25,7 +25,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Keep repository active
+      - name: Prepare monthly keepalive marker
         if: github.event_name == 'schedule'
         shell: bash
         run: |
@@ -34,13 +34,6 @@ jobs:
 
           if [ "$current_month" != "$saved_month" ]; then
             echo "$current_month" > .github/keepalive-month.txt
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-            git add .github/keepalive-month.txt
-            git commit -m "chore: keep scheduled workflow active"
-            git push origin "HEAD:${{ github.event.repository.default_branch }}"
           fi
 
       - name: Set up Python
@@ -62,7 +55,29 @@ jobs:
           VK_FEED_TITLE: "doujinmusic — VK wall"
           VK_POST_LIMIT: "200"
           VK_PAGE_SIZE: "20"
+          RSS_STATE_FILE: "data/feed_state.json"
+          RSS_PREVIOUS_FEED_URL: "https://suteakadechi.github.io/vk-doujinmusic-rss/index.xml"
         run: python scrape_vk.py
+
+      - name: Persist RSS item state
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/feed_state.json
+          if [ -f .github/keepalive-month.txt ]; then
+            git add .github/keepalive-month.txt
+          fi
+
+          if git diff --cached --quiet; then
+            echo "RSS state is unchanged"
+            exit 0
+          fi
+
+          git commit -m "chore: update RSS item state"
+          git pull --rebase origin "${{ github.event.repository.default_branch }}"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
 
       - name: Upload debug files when scraping fails
         if: failure()
